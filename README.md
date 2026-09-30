@@ -101,6 +101,20 @@ consecutive windows; crossing notes keep their physical IDs.
 | 5 | Frame-local boundary | `2b/1920 - 1`; SUSTAIN uses 0 |
 | 6 | Remaining duration | `2 log1p(min(d,983040)/48000) / log1p(983040/48000) - 1` |
 
+The actual V8 model uses `framewise_event_set_768_clean_reference`. Its learned
+MIDI encoder consumes **all seven numeric fields, including category sin/cos**,
+alongside a 16D event-kind embedding and a 32D pitch embedding: 55 dimensions
+enter the row MLP, and six pooled 128D summaries form the 768D frame condition.
+Although `category_id` accompanies the rows, this mode does not use a learned
+program lookup. This was checked against the V8 run/checkpoint settings and
+its saved MIDI encoder weights.
+
+The separate V3-SQ Variant 4 mode, `program_labeled_notes_kv`, uses a learned
+`Embedding(40,128)` for program identity and excludes the category sin/cos
+fields. That lookup is equivalent to projecting a 40D one-hot vector, but it
+is not the V8 encoder. This standalone package exposes the fixed note arrays
+before the learned encoder, rather than its learned 768D output.
+
 A melodic note occupies every frame intersecting its interval. ONSET takes
 precedence when a short note starts and ends within one frame; its duration
 still encodes the ending. An offset exactly at a frame boundary belongs to
