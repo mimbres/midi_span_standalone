@@ -15,8 +15,6 @@ import numpy as np
 
 from midi_span import (
     MidiPerformance, Note, read_midi, write_midi,
-    encode_spansynth_notes, decode_spansynth_notes,
-    encode_spansynth_midi, decode_spansynth_midi,
     encode_flowamt_notes, decode_flowamt_notes,
     encode_flowamt_midi, decode_flowamt_midi,
     canonicalize_flowamt_notes,
@@ -80,75 +78,6 @@ class MidiIOTests(unittest.TestCase):
             midi.save(path)
             with self.assertRaises(ValueError):
                 read_midi(path, sample_rate=16_000)
-
-
-class SpanSynthTests(unittest.TestCase):
-    def test_same_frame_exact_boundary_and_overlapping_notes(self):
-        source = performance([
-            Note(0, 1, 0, 1), Note(1, 1919, 60, 127),
-            Note(1919, 1920, 60, 60), Note(1920, 3840, 127, 80),
-            Note(2, 9000, 72, 90), Note(3, 4000, 72, 50),
-        ], 48_000, 10_000)
-        encoding = encode_spansynth_notes(source)
-        self.assertEqual(encoding.numeric.shape, (1, 512, 128, 7))
-        self.assertEqual(encoding.numeric.dtype, np.float32)
-        self.assertEqual(encoding.kind_id.shape, (1, 512, 128))
-        decoded = decode_spansynth_notes(encoding)
-        self.assertEqual(ordered(decoded.notes), ordered(source.notes))
-        self.assertEqual(decoded.length_samples, source.length_samples)
-
-    def test_multiple_windows_and_long_duration(self):
-        horizon = 512 * 1920
-        source = performance([
-            Note(7, 2 * horizon + 5000, 60, 83),
-            Note(horizon - 1, horizon + 1, 64, 99),
-            Note(horizon, horizon + 1920, 67, 100),
-        ], 48_000, 2 * horizon + 9000)
-        encoding = encode_spansynth_notes(source)
-        self.assertEqual(encoding.numeric.shape[0], 3)
-        decoded = decode_spansynth_notes(encoding)
-        self.assertEqual(ordered(decoded.notes), ordered(source.notes))
-        self.assertEqual(decoded.length_samples, source.length_samples)
-
-    def test_categories_and_drum_duration_are_canonical(self):
-        source = performance([Note(0, 5000, 60, 100, 7),
-                              Note(200, 300, 36, 110, 128)], 48_000, 6000)
-        decoded = decode_spansynth_notes(encode_spansynth_notes(source))
-        self.assertEqual(decoded.notes[0].program, 0)
-        drum = next(note for note in decoded.notes if note.is_drum)
-        self.assertEqual(drum.offset - drum.onset, 4800)
-
-    def test_capacity_is_128_without_truncation(self):
-        notes = [Note(0, 2000, p, 70) for p in range(128)]
-        encoding = encode_spansynth_notes(performance(notes, 48_000))
-        self.assertEqual(int(encoding.event_valid[0, 0].sum()), 128)
-        with self.assertRaises(ValueError):
-            encode_spansynth_notes(performance(notes + [Note(1, 1000, 0, 80)], 48_000))
-
-    def test_unsupported_program_and_wrong_clock(self):
-        with self.assertRaises(ValueError):
-            encode_spansynth_notes(performance([Note(0, 20, 60, 80, 96)], 48_000))
-        with self.assertRaises(ValueError):
-            encode_spansynth_notes(performance([], 16_000))
-
-    def test_file_roundtrip(self):
-        source = performance([Note(0, 10_000, 60, 80), Note(8000, 12_345, 64, 111)],
-                             48_000, 16_000)
-        with tempfile.TemporaryDirectory() as directory:
-            original = write_midi(source, Path(directory) / "input.mid")
-            encoding = encode_spansynth_midi(original)
-            path = decode_spansynth_midi(encoding, Path(directory) / "output.mid")
-            decoded = read_midi(path, sample_rate=48_000)
-        self.assertEqual(ordered(decoded.notes), ordered(source.notes))
-        self.assertEqual(decoded.length_samples, source.length_samples)
-
-    def test_mutated_boundary_and_nan_are_rejected(self):
-        encoding = encode_spansynth_notes(performance([Note(0, 20, 60, 80)], 48_000))
-        for value in (1.0, float("nan")):
-            numeric = encoding.numeric.copy()
-            numeric[0, 0, 0, 5] = value
-            with self.assertRaises(ValueError):
-                decode_spansynth_notes(replace(encoding, numeric=numeric))
 
 
 class FlowAMTTests(unittest.TestCase):

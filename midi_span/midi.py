@@ -168,8 +168,8 @@ def read_midi(path: str | Path, *, sample_rate: int) -> MidiPerformance:
 def write_midi(performance: MidiPerformance, path: str | Path) -> Path:
     """Write canonical type-1 MIDI; return the saved path.
 
-    The output has a fixed 120 BPM tempo and 24,000 ticks per beat. Both
-    codec sample clocks (48 kHz and 16 kHz) map exactly onto its ticks. Tracks
+    The output has a fixed 120 BPM tempo and 24,000 ticks per beat. The
+    FlowAMT sample clock (16 kHz) maps exactly onto its ticks. Tracks
     group notes by program. Overlapping equal pitches use separate voices so
     their intervals remain distinguishable on reread; extra voices/programs
     use standard MIDI ports when the 15 melodic channels are exhausted.
