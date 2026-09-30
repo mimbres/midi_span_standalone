@@ -3,7 +3,9 @@
 Convert piano MIDI into fixed continuous ON/OFF endpoint coordinates for
 **DiT conditioning and generation targets**, then decode those coordinates
 back into MIDI. Encoding and decoding need **no training, neural model, or
-checkpoint**. The package uses only NumPy and Mido.
+checkpoint**. The fixed codec uses only NumPy and Mido. Optional PyTorch
+functions provide field-balanced MSE, differentiable ODE exposure, and
+decoder-aligned Prefix CE with rational-tail gradients for your model.
 
 The representation is adapted from the small FlowAMT `v2_offset` PoC. Piano
 is the default; an explicit option retains the original Piano/Guitar/Bass
@@ -17,21 +19,33 @@ Python 3.11 or later is required.
 ```bash
 git clone https://github.com/mimbres/midi_span_standalone.git
 cd midi_span_standalone
-python -m pip install .
+python -m pip install -e .
 ```
+
+To include the training functions:
+
+```bash
+python -m pip install -e '.[training]'
+```
+
+The distribution name is `midi-span-standalone`, and the import package is
+`midi_span`. The source AnySynth projects use `anysynth.midi_span`, so these
+packages can coexist in one environment. This package does not install or
+replace `anysynth`. Two AnySynth clones still share their own `anysynth`
+distribution and should not both be editable installs in one environment.
 
 ## MIDI file roundtrip
 
 ```python
-from midi_span import encode_flowamt_midi, decode_flowamt_midi
+from midi_span import encode_midi, decode_midi
 
-encoded = encode_flowamt_midi("piano.mid")
+encoded = encode_midi("piano.mid")
 print(encoded.values.shape)    # [T,288]
 print(encoded.features.shape)  # [T,32,9]; a view of values
-decode_flowamt_midi(encoded, "piano_roundtrip.mid")
+decode_midi(encoded, "piano_roundtrip.mid")
 ```
 
-The encoder returns `FlowAMTEncoding`, containing ordinary NumPy coordinates,
+The encoder returns `MidiSpanEncoding`, containing ordinary NumPy coordinates,
 `length_samples`, and the selected program mode. The decoder returns the saved
 MIDI file's `Path`. No original MIDI or backup note list is stored.
 
@@ -39,7 +53,7 @@ Sample-grid notes are supported directly:
 
 ```python
 from midi_span import (
-    Note, MidiPerformance, encode_flowamt_notes, decode_flowamt_notes,
+    Note, MidiPerformance, encode_notes, decode_notes,
 )
 
 music = MidiPerformance(
@@ -47,8 +61,8 @@ music = MidiPerformance(
     sample_rate=16000,
     length_samples=20000,  # Retain trailing silence.
 )
-encoded = encode_flowamt_notes(music)
-assert decode_flowamt_notes(encoded) == music
+encoded = encode_notes(music)
+assert decode_notes(encoded) == music
 ```
 
 Programs use zero-based GM numbers. Note intervals are half-open
@@ -110,15 +124,15 @@ After your model produces a finite float32 array, decoding requires only that
 array and its timeline length:
 
 ```python
-from midi_span import FlowAMTEncoding, decode_flowamt_midi
+from midi_span import MidiSpanEncoding, decode_midi
 
 # generated_values: your model's NumPy float32 output, shape [T,288].
 # length_samples: the intended output length on the 16 kHz sample clock.
-generated = FlowAMTEncoding(
+generated = MidiSpanEncoding(
     values=generated_values,
     length_samples=length_samples,
 )
-decode_flowamt_midi(generated, "generated.mid")
+decode_midi(generated, "generated.mid")
 ```
 
 The original MIDI and its encoding are not needed for this operation. With
@@ -130,8 +144,87 @@ training can operate on the continuous coordinates before projection.
 The current decoder is strict: orphan OFFs, repeated unclosed ONs, unclosed
 notes at the end, and endpoints beyond `length_samples` raise errors. It
 therefore does not promise a MIDI file for every arbitrary generated array.
-The package supplies the fixed representation and decoder; it does not supply
-a DiT, training loss, or sampling loop.
+The package supplies the fixed representation, decoder, and optional training
+functions below. Your project supplies the DiT and its conditioning frontend.
+
+## Training functions
+
+Import [training.py](midi_span/training.py) explicitly. Normal `import midi_span`
+does not import PyTorch. All training functions accept either `[B,T,288]` or
+`[B,T,32,9]`; tensors within one call must use the same layout and device.
+`valid_mask` is an optional boolean `[B,T]` mask, with at least one valid frame
+per example.
+
+| Function | Purpose |
+| --- | --- |
+| `field_mse(prediction, target, clean, valid_mask=...)` | Balance the five musical fields using clean endpoint occupancy. Returns `FieldLoss` with `.total` and each field's MSE. |
+| `differentiable_euler(velocity_fn, noise, steps=4, valid_mask=...)` | Generate an endpoint while retaining gradients through the Euler steps. The callback binds your model's conditions and padding mask. |
+| `prefix_cross_entropy(endpoint, clean, valid_mask=...)` | Supervise ON/OFF endpoint counts with decoder-aligned Prefix CE and rational-tail backward gradients. Returns `PrefixLoss` with `.total` and group means/counts. |
+| `prefix_logits(endpoint)` | Inspect the 17 count logits for each ON/OFF bank, shaped `[B,T,2,17]`. Their argmax matches the decoder's prefix rule. |
+
+`field_mse` averages ON occupied/empty and OFF occupied/empty presence errors
+equally over available groups. Program, pitch, velocity, and within-frame time
+are supervised only on occupied lanes. Program loss balances the available
+P/G/B groups, including the single constant piano group for piano-only input.
+The total averages available fields, rather than all 288 coordinates.
+
+Prefix CE uses the clean endpoint counts 0–16 as labels. Logits are four times
+the cumulative hard-clamped presence scores, including the empty prefix. CE
+is normalized by `log(17)` and balances ON-empty/nonempty and OFF-empty/nonempty
+frame groups. Its rational-tail backward gradient is one inside `[-1,1]` and
+`1/(1+d)^2` outside, where `d` is distance from that interval. Forward projection
+stays identical to the decoder. A perfect clean endpoint still has positive
+soft CE. Neither count supervision nor the field loss guarantees valid
+chronological ON/OFF pairing for every generated sample.
+
+### Connect to your velocity model
+
+This example assumes FP32 `clean` endpoints `[B,T,288]`, a tensor `condition`
+with the same batch dimension, a boolean `valid_mask`, and your velocity model
+with the illustrated call signature. Adapt the calls to your model's API.
+
+```python
+import torch
+from midi_span.training import (
+    field_mse, differentiable_euler, prefix_cross_entropy,
+)
+
+# Same-index linear flow matching: no endpoint assignment or matching stage.
+noise = torch.randn_like(clean).masked_fill(~valid_mask[..., None], 0.0)
+t = torch.rand(clean.shape[0], device=clean.device, dtype=torch.float32)
+state = (1 - t[:, None, None]) * noise + t[:, None, None] * clean
+state = state.masked_fill(~valid_mask[..., None], 0.0)
+prediction = velocity_model(state, t, condition, valid_mask=valid_mask)
+flow = field_mse(prediction, clean - noise, clean, valid_mask=valid_mask)
+
+# Reuse CFM noise on a smaller batch for the extra four model evaluations.
+k = min(16, clean.shape[0])
+endpoint_mask = valid_mask[:k]
+
+def exposure_velocity(state, t):
+    return velocity_model(state, t, condition[:k], valid_mask=endpoint_mask)
+
+endpoint = differentiable_euler(
+    exposure_velocity, noise[:k], steps=4, valid_mask=endpoint_mask,
+)
+exposure = field_mse(endpoint, clean[:k], clean[:k], valid_mask=endpoint_mask)
+prefix = prefix_cross_entropy(endpoint, clean[:k], valid_mask=endpoint_mask)
+loss = flow.total + 0.1 * exposure.total + 0.1 * prefix.total
+loss.backward()
+```
+
+Both endpoint losses share the same rollout. Prefix CE adds no model call.
+ODE exposure keeps the four model-call graphs for backward, so the subset
+size controls its memory cost. All loss reductions and state updates use FP32;
+prefix accumulation uses FP64 as in the fixed decoder and requires a device
+that supports FP64, such as CPU or CUDA.
+
+The example weights and four-step/16-example exposure reflect the historical
+PoC continuation. They are not a validated fresh piano-only training recipe.
+Your trainer controls loss weights, their warmup schedules, subset size, and
+optimizer. These functions require no separate encoder/decoder training.
+For sampling, use `differentiable_euler` under `torch.no_grad()` with your chosen
+step count, then convert its output to NumPy for `decode_midi`.
 
 ## Pedal-held reattacks
 
@@ -141,8 +234,8 @@ raises an error. For intentional overlaps, including piano sustain-pedal
 reattacks, select the explicit preprocessing option:
 
 ```python
-encoded = encode_flowamt_midi("pedal_piano.mid", overlap_policy="reattack")
-decode_flowamt_midi(encoded, "pedal_piano_canonical.mid")
+encoded = encode_midi("pedal_piano.mid", overlap_policy="reattack")
+decode_midi(encoded, "pedal_piano_canonical.mid")
 ```
 
 This applies the historical activity-union/reattack rule before encoding:
@@ -153,7 +246,7 @@ The original multi-source near-onset doubling merge is not applied.
 
 The roundtrip target is the resulting nonoverlapping note sequence. Inspect
 that target with
-`canonicalize_flowamt_notes(read_midi(path, sample_rate=16000))`.
+`canonicalize_notes(read_midi(path, sample_rate=16000))`.
 
 ## Optional historical program groups
 
@@ -187,6 +280,9 @@ reattacks, exact sample/frame boundaries, all legal pitch/velocity/subsample
 values, piano-only projection, prefix ties, and explicit overflow/invalid
 endpoint errors. The coordinates and projections were also compared directly
 with the original production Torch implementation.
+With the training extra, tests also cover field/group balance, padding and null
+payload exclusion, rational-tail gradients, and gradient flow through Euler
+exposure. Losses and gradients were compared with the original PoC functions.
 
 ## Origins and license
 
@@ -198,8 +294,9 @@ The sustain/FIFO parsing behavior includes adaptations from YourMT3. Source
 copyright notices are retained.
 
 Lane attention and mel scaling changed the original model/audio frontend.
-Prefix CE, rational-tail gradients, and semi-CRF changed training, without
-changing these endpoint coordinates. **Semi-CRF is a training auxiliary term
-and is excluded from encode/decode.**
+This package includes the field loss, ODE exposure, and rational-tail Prefix CE
+without importing that model or frontend. The later semi-CRF needed an extra
+training head and interval targets and is excluded from this package. None of
+these training additions change the endpoint coordinates or fixed decoder.
 
 Released under [Apache-2.0](LICENSE).

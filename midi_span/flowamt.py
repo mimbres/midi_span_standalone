@@ -68,7 +68,7 @@ def _validate_program_mode(program_mode: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class FlowAMTEncoding:
+class MidiSpanEncoding:
     """FP32 ``[T,288]`` endpoints and the MIDI timeline's sample length.
 
     Each frame contains 16 ON lanes followed by 16 OFF lanes. An occupied
@@ -124,7 +124,7 @@ class _Endpoint:
 
 def _program_index(note: Note, program_mode: str) -> int:
     if note.is_drum:
-        raise ValueError("FlowAMT does not represent drums")
+        raise ValueError("MIDI endpoints do not represent drums")
     ranges = _PROGRAM_RANGES[:1] if program_mode == "piano" else _PROGRAM_RANGES
     for index, (lower, upper) in enumerate(ranges):
         if lower <= note.program <= upper:
@@ -132,10 +132,10 @@ def _program_index(note: Note, program_mode: str) -> int:
     allowed = "Piano programs 0–7" if program_mode == "piano" else (
         "Piano 0–7, Guitar 24–31, or Bass 32–39 programs"
     )
-    raise ValueError(f"FlowAMT requires {allowed}; got program {note.program}")
+    raise ValueError(f"MIDI endpoints require {allowed}; got program {note.program}")
 
 
-def canonicalize_flowamt_notes(
+def canonicalize_notes(
     performance: MidiPerformance, *, program_mode: str = "piano"
 ) -> MidiPerformance:
     """Map programs and turn same-pitch overlaps into explicit reattack notes.
@@ -157,7 +157,7 @@ def canonicalize_flowamt_notes(
     if not isinstance(performance, MidiPerformance):
         raise TypeError("performance must be a MidiPerformance")
     if performance.sample_rate != SAMPLE_RATE:
-        raise ValueError("FlowAMT requires notes quantized at 16000 Hz")
+        raise ValueError("MIDI endpoints require notes quantized at 16000 Hz")
 
     tracks: dict[tuple[int, int], dict[int, Note]] = {}
     for note in performance.notes:
@@ -208,10 +208,10 @@ def canonicalize_flowamt_notes(
     )
 
 
-def encode_flowamt_notes(
+def encode_notes(
     performance: MidiPerformance, *, program_mode: str = "piano",
     overlap_policy: str = "reject",
-) -> FlowAMTEncoding:
+) -> MidiSpanEncoding:
     """Encode sample-quantized notes as ordered physical ON/OFF endpoints.
 
     Piano programs 0–7 decode to program 0. With ``program_mode="pgb"``,
@@ -219,7 +219,7 @@ def encode_flowamt_notes(
     programs and drums are rejected. With the default ``overlap_policy="reject"``,
     notes sharing a mapped program and pitch must not overlap. Adjacent reattacks
     are allowed. ``overlap_policy="reattack"`` first applies
-    :func:`canonicalize_flowamt_notes`, which changes overlapping note intervals
+    :func:`canonicalize_notes`, which changes overlapping note intervals
     into a nonoverlapping activity union with explicit reattacks. More than 16
     ON or 16 OFF endpoints in a frame are rejected without truncation.
     """
@@ -230,9 +230,9 @@ def encode_flowamt_notes(
     if not isinstance(performance, MidiPerformance):
         raise TypeError("performance must be a MidiPerformance")
     if performance.sample_rate != SAMPLE_RATE:
-        raise ValueError("FlowAMT requires notes quantized at 16000 Hz")
+        raise ValueError("MIDI endpoints require notes quantized at 16000 Hz")
     if overlap_policy == "reattack":
-        performance = canonicalize_flowamt_notes(
+        performance = canonicalize_notes(
             performance, program_mode=program_mode
         )
 
@@ -283,24 +283,24 @@ def encode_flowamt_notes(
             cell[6:8] = _VELOCITY_ENCODING[endpoint.velocity - 1]
             cell[8] = _SUBSAMPLE_ENCODING[endpoint.sample % HOP_LENGTH]
 
-    return FlowAMTEncoding(
+    return MidiSpanEncoding(
         features.reshape(frame_count, FRAME_WIDTH),
         performance.length_samples,
         program_mode,
     )
 
 
-def encode_flowamt_midi(
+def encode_midi(
     path: str | Path, *, program_mode: str = "piano",
     overlap_policy: str = "reject",
-) -> FlowAMTEncoding:
+) -> MidiSpanEncoding:
     """Read MIDI at 16000 Hz and encode, with an explicit overlap policy.
 
-    ``"reattack"`` applies :func:`canonicalize_flowamt_notes` to sounding notes,
+    ``"reattack"`` applies :func:`canonicalize_notes` to sounding notes,
     including overlaps caused by the sustain pedal. ``"reject"`` is the default.
     """
 
-    return encode_flowamt_notes(
+    return encode_notes(
         read_midi(path, sample_rate=SAMPLE_RATE), program_mode=program_mode,
         overlap_policy=overlap_policy,
     )
@@ -313,7 +313,7 @@ def _nearest_index(value: np.ndarray, codebook: np.ndarray) -> int:
     return int(distances.argmin())
 
 
-def _decode_endpoints(encoding: FlowAMTEncoding) -> list[_Endpoint]:
+def _decode_endpoints(encoding: MidiSpanEncoding) -> list[_Endpoint]:
     bounded = np.clip(encoding.features, -1.0, 1.0)
     presence = bounded[..., 0].reshape(-1, 2, LANES_PER_BANK)
     prefix_scores = np.concatenate(
@@ -342,7 +342,7 @@ def _decode_endpoints(encoding: FlowAMTEncoding) -> list[_Endpoint]:
     return endpoints
 
 
-def decode_flowamt_notes(encoding: FlowAMTEncoding) -> MidiPerformance:
+def decode_notes(encoding: MidiSpanEncoding) -> MidiPerformance:
     """Project coordinates and pair endpoints by mapped program and pitch.
 
     Prefix count is the argmax of FP64 cumulative presence, including count
@@ -358,8 +358,8 @@ def decode_flowamt_notes(encoding: FlowAMTEncoding) -> MidiPerformance:
     raise. Clean supported encodings roundtrip to their mapped note content.
     """
 
-    if not isinstance(encoding, FlowAMTEncoding):
-        raise TypeError("encoding must be a FlowAMTEncoding")
+    if not isinstance(encoding, MidiSpanEncoding):
+        raise TypeError("encoding must be a MidiSpanEncoding")
     # Values remain editable for experiments; validate again before decoding.
     encoding.__post_init__()
     endpoints = _decode_endpoints(encoding)
@@ -415,17 +415,17 @@ def decode_flowamt_notes(encoding: FlowAMTEncoding) -> MidiPerformance:
     )
 
 
-def decode_flowamt_midi(encoding: FlowAMTEncoding, path: str | Path) -> Path:
+def decode_midi(encoding: MidiSpanEncoding, path: str | Path) -> Path:
     """Decode an endpoint encoding and write a canonical MIDI file."""
 
-    return write_midi(decode_flowamt_notes(encoding), path)
+    return write_midi(decode_notes(encoding), path)
 
 
 __all__ = [
-    "FlowAMTEncoding",
-    "canonicalize_flowamt_notes",
-    "encode_flowamt_notes",
-    "encode_flowamt_midi",
-    "decode_flowamt_notes",
-    "decode_flowamt_midi",
+    "MidiSpanEncoding",
+    "canonicalize_notes",
+    "encode_notes",
+    "encode_midi",
+    "decode_notes",
+    "decode_midi",
 ]
